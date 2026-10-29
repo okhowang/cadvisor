@@ -29,8 +29,19 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	info "github.com/google/cadvisor/info/v1"
+	cadvisorcontainer "github.com/google/cadvisor/lib/container"
 	"github.com/google/cadvisor/lib/fs"
 )
+
+type stubMachineInfoFactory struct{}
+
+func (stubMachineInfoFactory) GetMachineInfo() (*info.MachineInfo, error) {
+	return &info.MachineInfo{}, nil
+}
+
+func (stubMachineInfoFactory) GetVersionInfo() (*info.VersionInfo, error) {
+	return &info.VersionInfo{}, nil
+}
 
 type mockDockerClientForExitCode struct {
 	dclient.APIClient
@@ -64,6 +75,51 @@ func TestStorageDirDetectionWithNewVersions(t *testing.T) {
 	as.Nil(err)
 	as.Equal(rwLayer, randomizedID)
 
+}
+
+func TestKnownStorageDriver(t *testing.T) {
+	as := assert.New(t)
+
+	for _, sd := range []StorageDriver{
+		DevicemapperStorageDriver, AufsStorageDriver, OverlayStorageDriver,
+		Overlay2StorageDriver, ContainerdSnapshotterStorageDriver,
+		ZfsStorageDriver, VfsStorageDriver,
+	} {
+		as.True(knownStorageDriver(sd), "%q should be a known storage driver", sd)
+	}
+
+	// Out-of-tree drivers, e.g. block-device backed rootfs used by kata containers.
+	for _, sd := range []StorageDriver{"blockfile", "btrfs", ""} {
+		as.False(knownStorageDriver(sd), "%q should not be a known storage driver", sd)
+	}
+}
+
+// Unknown storage drivers must not produce filesystem stats, and must not fail
+// the whole stats collection either.
+func TestFsStatsWithUnknownStorageDriver(t *testing.T) {
+	as := assert.New(t)
+
+	stats := &info.ContainerStats{}
+	err := FsStats(stats, stubMachineInfoFactory{},
+		cadvisorcontainer.MetricSet{cadvisorcontainer.DiskUsageMetrics: struct{}{}},
+		"blockfile", nil, nil, "", "", "")
+
+	as.NoError(err)
+	as.Empty(stats.Filesystem)
+}
+
+// A failed read-write layer lookup leaves rootfsStorageDir empty; that must be
+// skipped rather than reported as an error.
+func TestFsStatsWithoutRootfsStorageDir(t *testing.T) {
+	as := assert.New(t)
+
+	stats := &info.ContainerStats{}
+	err := FsStats(stats, stubMachineInfoFactory{},
+		cadvisorcontainer.MetricSet{cadvisorcontainer.DiskUsageMetrics: struct{}{}},
+		Overlay2StorageDriver, &FsHandler{}, nil, "", "", "")
+
+	as.NoError(err)
+	as.Empty(stats.Filesystem)
 }
 
 func rawMetadataEnvMatch(dockerEnvWhiteList string, cntConfig container.Config) map[string]string {

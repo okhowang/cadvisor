@@ -106,6 +106,22 @@ type containerHandler struct {
 
 var _ container.ContainerHandler = &containerHandler{}
 
+// knownStorageDriver reports whether cadvisor understands the on-disk layout of
+// the given storage driver. Custom/out-of-tree drivers (e.g. "blockfile", used
+// for block-device backed rootfs such as kata containers) are not known, and no
+// filesystem usage metric can be derived for them. Such containers must still be
+// monitored for cpu/memory/network, so storage introspection is skipped instead
+// of failing the whole handler.
+func knownStorageDriver(sd StorageDriver) bool {
+	switch sd {
+	case DevicemapperStorageDriver, AufsStorageDriver, OverlayStorageDriver,
+		Overlay2StorageDriver, ContainerdSnapshotterStorageDriver,
+		ZfsStorageDriver, VfsStorageDriver:
+		return true
+	}
+	return false
+}
+
 func getRwLayerID(containerID, storageDir string, sd StorageDriver, dockerVersion []int) (string, error) {
 	const (
 		// Docker version >=1.10.0 have a randomized ID for the root fs of a container.
@@ -162,31 +178,40 @@ func newContainerHandler(
 	// FIXME: Give `otherStorageDir` a more descriptive name.
 	otherStorageDir := path.Join(storageDir, pathToContainersDir, id)
 
+	// Failures below only affect filesystem usage metrics. They must never abort
+	// the handler creation, otherwise cpu/memory/network metrics are lost as well.
 	var rootfsStorageDir, zfsFilesystem, zfsParent string
-	if storageDriver == ContainerdSnapshotterStorageDriver {
+	switch {
+	case storageDriver == ContainerdSnapshotterStorageDriver:
 		ctx := namespaces.WithNamespace(context.Background(), "moby")
 		cntr, err := containerdClient.LoadContainer(ctx, id)
 		if err != nil {
-			return nil, err
+			klog.V(2).Infof("Unable to load containerd container %q, disk usage metrics will not be reported: %v", id, err)
+			break
 		}
 
 		var spec specs.Spec
 		if err := json.Unmarshal(cntr.Spec.Value, &spec); err != nil {
-			return nil, err
+			klog.V(2).Infof("Unable to parse the spec of container %q, disk usage metrics will not be reported: %v", id, err)
+			break
 		}
 		rootfsStorageDir = spec.Root.Path
-	} else {
+	case knownStorageDriver(storageDriver):
 		rwLayerID, err := getRwLayerID(id, storageDir, storageDriver, dockerVersion)
 		if err != nil {
-			return nil, err
+			klog.V(2).Infof("Unable to determine the read-write layer of container %q, disk usage metrics will not be reported: %v", id, err)
+			break
 		}
 
 		// Determine the rootfs storage dir OR the pool name to determine the device.
 		// For devicemapper, we only need the thin pool name, and that is passed in to this call
 		rootfsStorageDir, zfsFilesystem, zfsParent, err = DetermineDeviceStorage(storageDriver, storageDir, rwLayerID)
 		if err != nil {
-			return nil, fmt.Errorf("unable to determine device storage: %v", err)
+			klog.V(2).Infof("Unable to determine device storage of container %q, disk usage metrics will not be reported: %v", id, err)
+			rootfsStorageDir, zfsFilesystem, zfsParent = "", "", ""
 		}
+	default:
+		klog.V(4).Infof("Unsupported docker storage driver %q, disk usage metrics will not be reported for container %q", storageDriver, id)
 	}
 
 	// We assume that if Inspect fails then the container is not known to docker.
@@ -261,7 +286,11 @@ func newContainerHandler(
 		handler.labels["restartcount"] = strconv.Itoa(ctnr.RestartCount)
 	}
 
-	if includedMetrics.Has(container.DiskUsageMetrics) {
+	// Note: for devicemapper and zfs, rootfsStorageDir is legitimately empty and the
+	// usage comes from the respective watcher, so only the storage driver is checked
+	// here. For unknown drivers FsStats() reports nothing, so starting the periodic
+	// disk usage computation would be pure overhead.
+	if includedMetrics.Has(container.DiskUsageMetrics) && knownStorageDriver(storageDriver) {
 		var deviceID string
 		if ctnr.GraphDriver != nil {
 			deviceID = ctnr.GraphDriver.Data["DeviceId"]

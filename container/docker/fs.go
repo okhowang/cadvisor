@@ -50,11 +50,19 @@ func FsStats(
 	}
 
 	if metrics.Has(container.DiskUsageMetrics) {
+		if fsHandler == nil {
+			// Storage introspection was skipped or failed for this container.
+			return nil
+		}
+
 		var device string
 		switch storageDriver {
 		case DevicemapperStorageDriver:
 			device = poolName
 		case AufsStorageDriver, OverlayStorageDriver, Overlay2StorageDriver, VfsStorageDriver:
+			if rootfsStorageDir == "" {
+				return nil
+			}
 			deviceInfo, err := globalFsInfo.GetDirFsDevice(rootfsStorageDir)
 			if err != nil {
 				return fmt.Errorf("unable to determine device info for dir: %v: %v", rootfsStorageDir, err)
